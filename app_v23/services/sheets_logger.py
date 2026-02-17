@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import List, Optional
 
@@ -23,10 +24,12 @@ def _get_env(name: str) -> str:
 
 def _svc():
     spreadsheet_id = _get_env("GOOGLE_SHEETS_ID")
-    cred_path = _get_env("GOOGLE_CREDENTIALS_PATH")
 
-    creds = service_account.Credentials.from_service_account_file(
-        cred_path,
+    raw_json = _get_env("GOOGLE_SHEET_SERVICE_ACCOUNT")
+    info = json.loads(raw_json)
+
+    creds = service_account.Credentials.from_service_account_info(
+        info,
         scopes=SCOPES,
     )
 
