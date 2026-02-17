@@ -1,4 +1,4 @@
-# app_v22_clean/core/indicator_engine.py
+# app_v23/core/indicator_engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass

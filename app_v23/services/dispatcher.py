@@ -1,4 +1,4 @@
-# app_v22_clean/services/dispatcher.py
+# app_v23/services/dispatcher.py
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -6,8 +6,8 @@ from typing import Optional
 import os
 import requests
 
-from app_v22_clean.core.indicator_engine import SignalPayload
-from app_v22_clean.services.sheets_logger import append_signal_row
+from app_v23.core.indicator_engine import SignalPayload
+from app_v23.services.sheets_logger import append_signal_row
 
 
 def _format_tg_message(p: SignalPayload) -> str:

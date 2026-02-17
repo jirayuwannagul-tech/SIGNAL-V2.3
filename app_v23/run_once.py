@@ -1,13 +1,13 @@
-# app_v22_clean/run_once.py
+# app_v23/run_once.py
 from __future__ import annotations
 
 import sys
 import time
 
-from app_v22_clean.services.binance_client import fetch_ohlcv, candles_to_dicts, fetch_last_price
-from app_v22_clean.core.indicator_engine import analyze_candles_for_signal
-from app_v22_clean.services.dispatcher import dispatch
-from app_v22_clean.services.position_store import (
+from app_v23.services.binance_client import fetch_ohlcv, candles_to_dicts, fetch_last_price
+from app_v23.core.indicator_engine import analyze_candles_for_signal
+from app_v23.services.dispatcher import dispatch
+from app_v23.services.position_store import (
     is_locked,
     create_position,
     update_on_price,
@@ -66,7 +66,7 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
 
 
 if __name__ == "__main__":
-    # usage: python -m app_v22_clean.run_once BTCUSDT 1d
+    # usage: python -m app_v23.run_once BTCUSDT 1d
     symbol = sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT"
     tf = sys.argv[2] if len(sys.argv) > 2 else "1d"
     raise SystemExit(run_once(symbol, tf))

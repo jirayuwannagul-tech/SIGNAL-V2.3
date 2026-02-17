@@ -1,4 +1,4 @@
-# app_v22_clean/services/position_store.py
+# app_v23/services/position_store.py
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from datetime import datetime, timezone
-from app_v22_clean.core.indicator_engine import SignalPayload
+from app_v23.core.indicator_engine import SignalPayload
 
 
 POSITIONS_FILE = Path("data/positions_clean.json")
@@ -127,7 +127,7 @@ def update_on_price(symbol: str, timeframe: str, last_price: float) -> str:
     # ---- update Google Sheet hit/status (optional) ----
     try:
         import os
-        from app_v22_clean.services.sheets_logger import update_hit_status
+        from app_v23.services.sheets_logger import update_hit_status
 
         tab = os.getenv("GOOGLE_SHEET_TAB", "Signals")
         update_hit_status(

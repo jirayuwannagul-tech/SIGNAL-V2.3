@@ -1,4 +1,4 @@
-# app_v22_clean/services/binance_client.py
+# app_v23/services/binance_client.py
 from __future__ import annotations
 
 from dataclasses import dataclass

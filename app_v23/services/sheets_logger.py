@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from app_v22_clean.core.indicator_engine import SignalPayload
+from app_v23.core.indicator_engine import SignalPayload
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
