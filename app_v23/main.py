@@ -138,6 +138,15 @@ def _run_2000_report_job() -> None:
     summary = get_daily_summary_payload()
     dispatch_daily_summary_to_sheet(summary)
 
+def _heartbeat_job() -> None:
+    # log ให้รู้ว่าระบบยังอยู่ + เวลาไทย
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = (os.getenv("SCHED_TZ", "Asia/Bangkok") or "Asia/Bangkok").strip()
+    now_th = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"HEARTBEAT ok at {now_th} tz={tz}", flush=True)    
+
 
 def _start_scheduler_if_enabled() -> None:
     if not _bool_env("ENABLE_INTERNAL_SCHEDULER", "0"):
@@ -166,6 +175,7 @@ def _start_scheduler_if_enabled() -> None:
     sched = BackgroundScheduler(timezone=tz)
     sched.add_job(_run_daily_job, "cron", hour=hour, minute=minute, id="run_daily_0705", replace_existing=True)
     sched.add_job(_run_2000_report_job, "cron", hour=rep_hour, minute=rep_min, id="daily_summary_2000", replace_existing=True)
+    sched.add_job(_heartbeat_job, "cron", minute="*/5", id="heartbeat_5min", replace_existing=True)
     sched.start()
 
 
