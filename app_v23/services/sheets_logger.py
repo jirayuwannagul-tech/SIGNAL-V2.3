@@ -152,4 +152,30 @@ def update_hit_status(
         body={"values": values},
     ).execute()
 
-    return True
+    def append_daily_summary_row(summary: dict, sheet_name: str = "Daily") -> None:
+        """
+        Draft columns (Daily tab):
+        A timestamp
+        B date
+        C scanned_today
+        D signals_today
+        E active_positions
+        """
+        service, spreadsheet_id = _svc()
+
+        values: List[List[object]] = [[
+            "=NOW()",
+            summary.get("date", ""),
+            int(summary.get("scanned_today", 0) or 0),
+            int(summary.get("signals_today", 0) or 0),
+            int(summary.get("active_positions", 0) or 0),
+        ]]
+
+        body = {"values": values}
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{sheet_name}'!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
