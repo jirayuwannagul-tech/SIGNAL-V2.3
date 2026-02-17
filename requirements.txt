@@ -1,0 +1,35 @@
+# Core Flask Application
+Flask==3.0.3
+requests==2.32.3
+python-dotenv==1.0.1
+
+# Job Scheduling
+APScheduler==3.10.4
+
+# Google Services Integration
+gspread==6.1.4
+google-auth==2.37.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.158.0
+
+# LINE Bot Integration
+line-bot-sdk==3.13.0
+
+# Technical Analysis
+ta==0.11.0
+pandas==2.2.3
+numpy==1.26.4
+
+# Data Processing
+pytz==2024.2
+
+# Development & Testing
+pytest==8.3.4
+pytest-cov==6.0.0
+
+# Web Server
+click==8.1.8
+gunicorn==22.0.0
+websocket-client==1.7.0
+
