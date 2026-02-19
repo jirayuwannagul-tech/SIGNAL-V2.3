@@ -15,12 +15,18 @@ from app_v23.services.position_store import (
     set_last_emitted_close_time_ms,
 )
 
+# Return codes
+RC_SUCCESS        = 0
+RC_SKIP           = 1   # ข้ามแบบปกติ (no signal, already emitted, locked)
+RC_INVALID_INPUT  = 2   # timeframe ไม่รองรับ / candle ไม่พอ
+RC_ERROR          = 3   # exception ที่ไม่คาดคิด
+
 
 def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
     # ✅ ใช้แค่ 1D
     if timeframe.lower() != "1d":
         print("ONLY_1D_ALLOWED")
-        return 0
+        return RC_INVALID_INPUT
 
     candles = candles_to_dicts(fetch_ohlcv(symbol, timeframe, limit=limit))
     now_ms = int(time.time() * 1000)
@@ -31,14 +37,14 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
         candles = candles[:-1]
         if len(candles) < 60:
             print("NOT_ENOUGH_CLOSED_CANDLES")
-            return 0
+            return RC_INVALID_INPUT
         last_close_time_ms = int(candles[-1]["close_time_ms"])
 
     # ✅ ยิงครั้งเดียวต่อแท่ง
     last_emitted = get_last_emitted_close_time_ms(symbol, timeframe)
     if last_emitted == last_close_time_ms:
         print("ALREADY_EMITTED_THIS_CANDLE")
-        return 0
+        return RC_SKIP
 
     # 🔒 ถ้ามี ACTIVE → อัปเดตราคาเพื่อปลดล็อกก่อน (ปลดเฉพาะ SL หรือ TP3)
     if is_locked(symbol, timeframe):
@@ -47,12 +53,12 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
         print(f"POSITION_UPDATE: {st} last={last}")
         if st != "CLOSED":
             print("LOCKED_SKIP")
-            return 0
+            return RC_SKIP
 
     sig = analyze_candles_for_signal(symbol, timeframe, candles)
     if not sig:
         print("NO_SIGNAL")
-        return 0
+        return RC_SKIP
 
     print(f"SIGNAL: {sig}")
     dispatch(sig)
@@ -62,7 +68,7 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
     set_last_emitted_close_time_ms(symbol, timeframe, last_close_time_ms)
 
     print("DISPATCHED")
-    return 0
+    return RC_SUCCESS
 
 
 if __name__ == "__main__":

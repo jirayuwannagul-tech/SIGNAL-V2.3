@@ -1,0 +1,1456 @@
+===== app_v23/__init__.py =====
+
+===== app_v23/check_deepest_workspace.py =====
+import sys, ast, re, hashlib
+from pathlib import Path
+from collections import defaultdict, deque
+from difflib import SequenceMatcher
+
+EXCLUDE_DIRS = {
+    ".venv","venv",".venv311","venv311","__pycache__", ".git",".pytest_cache",
+    "node_modules","dist","build"
+}
+
+def iter_py_files(root: Path):
+    for p in root.rglob("*.py"):
+        if any(part in EXCLUDE_DIRS for part in p.parts):
+            continue
+        yield p
+
+def read_text(p: Path) -> str:
+    raw = p.read_bytes()
+    txt = raw.decode("utf-8", errors="replace")
+    return txt.replace("\r\n","\n").replace("\r","\n")
+
+def module_name(root: Path, file_path: Path) -> str:
+    rel = file_path.relative_to(root).with_suffix("")
+    return ".".join(rel.parts)
+
+def norm_ast_dump(fn_node: ast.AST) -> str:
+    # normalize: remove lineno/col_offset/end_lineno/end_col_offset + ctx
+    def strip(n):
+        if isinstance(n, ast.AST):
+            for a in ("lineno","col_offset","end_lineno","end_col_offset"):
+                if hasattr(n, a):
+                    setattr(n, a, None)
+            if hasattr(n, "ctx"):
+                setattr(n, "ctx", None)
+            for k,v in ast.iter_fields(n):
+                if isinstance(v, list):
+                    for item in v:
+                        strip(item)
+                else:
+                    strip(v)
+    n2 = ast.fix_missing_locations(fn_node)
+    strip(n2)
+    return ast.dump(n2, include_attributes=False)
+
+def hash_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+def get_func_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    a = fn.args
+    def arg_names(args):
+        return [x.arg for x in args]
+    parts = []
+    parts += arg_names(a.posonlyargs)
+    parts += arg_names(a.args)
+    if a.vararg: parts.append("*" + a.vararg.arg)
+    parts += [x.arg for x in a.kwonlyargs]
+    if a.kwarg: parts.append("**" + a.kwarg.arg)
+    return f"{fn.name}({', '.join(parts)})"
+
+def extract_imports(tree: ast.AST):
+    imports = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                imports.append(a.name)
+        elif isinstance(n, ast.ImportFrom):
+            if n.module:
+                imports.append(n.module)
+    return imports
+
+def resolve_local_module(root: Path, mod: str):
+    # map "app.services.x" -> root/app/services/x.py
+    p = root / Path(*mod.split("."))
+    if p.with_suffix(".py").exists():
+        return p.with_suffix(".py")
+    if (p / "__init__.py").exists():
+        return p / "__init__.py"
+    return None
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def main():
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+    entry = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+
+    files = list(iter_py_files(root))
+    parsed = {}          # file -> tree
+    modmap = {}          # module -> file
+    file2mod = {}        # file -> module
+
+    # Parse
+    syntax_errors = []
+    for f in files:
+        try:
+            src = read_text(f)
+            tree = ast.parse(src, filename=str(f))
+            parsed[f] = (src, tree)
+            m = module_name(root, f)
+            modmap[m] = f
+            file2mod[f] = m
+        except SyntaxError as e:
+            syntax_errors.append(f"{f}:{e.lineno}:{e.offset} SyntaxError: {e.msg}")
+
+    print(f"Root: {root}")
+    if syntax_errors:
+        print("\n(0) Syntax errors:")
+        for e in syntax_errors: print(" ", e)
+        return
+
+    # (A) Shadowing: same def name in same module (last wins)
+    shadow = defaultdict(list)  # file -> [(name, line1, line2..)]
+    for f,(src,tree) in parsed.items():
+        defs = defaultdict(list)
+        for n in tree.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs[n.name].append(n.lineno)
+        for name, lines in defs.items():
+            if len(lines) > 1:
+                shadow[f].append((name, lines))
+
+    # (B) Flask route collisions (decorators)
+    routes = defaultdict(list)  # (path, methods_tuple) -> [(file,line,func)]
+    route_pat = re.compile(r"""@app\.route\(\s*(['"])(.+?)\1(?:\s*,\s*methods\s*=\s*\[([^\]]+)\])?""")
+    for f,(src,tree) in parsed.items():
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not n.decorator_list: continue
+                for d in n.decorator_list:
+                    try:
+                        text = ast.get_source_segment(src, d) or ""
+                    except Exception:
+                        text = ""
+                    m = route_pat.search(text)
+                    if m:
+                        path = m.group(2)
+                        methods_raw = m.group(3)
+                        if methods_raw:
+                            methods = tuple(sorted([x.strip().strip("'\"") for x in methods_raw.split(",") if x.strip()]))
+                        else:
+                            methods = ("GET",)
+                        routes[(path, methods)].append((str(f), n.lineno, n.name))
+
+    route_dups = {k:v for k,v in routes.items() if len(v) > 1}
+
+    # (C) Duplicate / Similar functions across workspace
+    func_index = []  # (file, lineno, qualname, sig, norm_dump, hash, src_segment)
+    for f,(src,tree) in parsed.items():
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                dump = norm_ast_dump(n)
+                h = hash_str(dump)
+                seg = ast.get_source_segment(src, n) or ""
+                sig = get_func_signature(n)
+                func_index.append((f, n.lineno, n.name, sig, dump, h, seg))
+
+    by_hash = defaultdict(list)
+    for item in func_index:
+        by_hash[item[5]].append(item)
+
+    identical = {h:v for h,v in by_hash.items() if len(v) > 1}
+
+    # Similarity (heavy): compare same-name or same-signature only
+    by_name = defaultdict(list)
+    by_sig = defaultdict(list)
+    for it in func_index:
+        by_name[it[2]].append(it)
+        by_sig[it[3]].append(it)
+
+    similar_hits = []  # (score, a, b)
+    def consider_group(group):
+        items = group
+        if len(items) < 2: return
+        for i in range(len(items)):
+            for j in range(i+1, len(items)):
+                a = items[i]; b = items[j]
+                if a[0] == b[0]:  # same file handled by shadowing already
+                    continue
+                # compare normalized dumps (structure) first
+                s = similarity(a[4], b[4])
+                if s >= 0.92 and a[5] != b[5]:
+                    similar_hits.append((s, a, b))
+
+    for nm, items in by_name.items():
+        if len(items) >= 2:
+            consider_group(items)
+    for sg, items in by_sig.items():
+        if len(items) >= 2:
+            consider_group(items)
+
+    similar_hits.sort(reverse=True, key=lambda x: x[0])
+
+    # (D) Import graph + reachable files from entrypoint
+    imports_graph = defaultdict(set)  # file -> set(files)
+    for f,(src,tree) in parsed.items():
+        imps = extract_imports(tree)
+        for mod in imps:
+            # only resolve local modules
+            target = resolve_local_module(root, mod)
+            if target and target in parsed:
+                imports_graph[f].add(target)
+
+    reachable = set()
+    if entry:
+        entry = entry.resolve()
+        if not entry.exists():
+            print(f"\n[WARN] entry not found: {entry}")
+        else:
+            q = deque([entry])
+            while q:
+                cur = q.popleft()
+                if cur in reachable: continue
+                reachable.add(cur)
+                for nxt in imports_graph.get(cur, []):
+                    if nxt not in reachable:
+                        q.append(nxt)
+
+    # REPORT
+    print("\n(1) Shadowing (def ชื่อซ้ำในไฟล์เดียวกัน -> ตัวท้ายทับตัวก่อน)")
+    if not shadow:
+        print("  OK: none")
+    else:
+        for f, items in shadow.items():
+            print(f"  {f}")
+            for name, lines in items:
+                print(f"    - {name}: lines {lines}")
+
+    print("\n(2) Route collisions (@app.route path+methods ซ้ำ)")
+    if not route_dups:
+        print("  OK: none")
+    else:
+        for (path, methods), locs in sorted(route_dups.items()):
+            print(f"  - {path} {methods}")
+            for ff, ln, fn in locs:
+                print(f"    {ff}:{ln} {fn}")
+
+    print("\n(3) Identical functions (โค้ดเหมือนกันเป๊ะ)")
+    if not identical:
+        print("  OK: none")
+    else:
+        for h, items in identical.items():
+            print(f"  - hash={h} count={len(items)}")
+            for f,ln,name,sig,_,_,_ in items:
+                print(f"    {f}:{ln} {sig}")
+
+    print("\n(4) Highly similar functions (โครงสร้างคล้ายกันมาก >=0.92)")
+    if not similar_hits:
+        print("  OK: none")
+    else:
+        for s,a,b in similar_hits[:30]:
+            af,al,an,asig,_,_,_ = a
+            bf,bl,bn,bsig,_,_,_ = b
+            print(f"  - score={s:.3f}")
+            print(f"    A: {af}:{al} {asig}")
+            print(f"    B: {bf}:{bl} {bsig}")
+
+    if entry:
+        print(f"\n(5) Reachability from entrypoint: {entry}")
+        print(f"  reachable_files = {len(reachable)} / all_files = {len(files)}")
+        dead = [f for f in files if f not in reachable]
+        # show only within root, sorted
+        dead = sorted(dead, key=lambda x: str(x))
+        print("  possibly-unreferenced (by import graph only):")
+        for f in dead[:60]:
+            print(f"   - {f}")
+        if len(dead) > 60:
+            print(f"   ... (+{len(dead)-60} more)")
+
+if __name__ == "__main__":
+    main()
+
+===== app_v23/core/indicator_engine.py =====
+# app_v23/core/indicator_engine.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Literal
+
+
+Direction = Literal["LONG", "SHORT"]
+
+
+@dataclass(frozen=True)
+class SignalPayload:
+    symbol: str
+    timeframe: str
+    direction: Direction
+    entry_price: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    tp3: float
+    reason: str
+
+
+def _ema(values: List[float], length: int) -> List[float]:
+    if length <= 0:
+        raise ValueError("EMA length must be > 0")
+    if not values:
+        return []
+    k = 2 / (length + 1)
+    ema = [values[0]]
+    for v in values[1:]:
+        ema.append((v * k) + (ema[-1] * (1 - k)))
+    return ema
+
+
+def _atr(highs: List[float], lows: List[float], closes: List[float], length: int = 14) -> List[float]:
+    if len(highs) != len(lows) or len(lows) != len(closes):
+        raise ValueError("ATR input lengths mismatch")
+    if not highs:
+        return []
+    trs: List[float] = []
+    prev_close = closes[0]
+    for h, l, c in zip(highs, lows, closes):
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    return _ema(trs, length)
+
+
+def _barssince(cond: List[bool]) -> List[int]:
+    """
+    Pine: ta.barssince(cond)
+    - ถ้า cond เป็น True ที่แท่งนั้น -> 0
+    - ถ้ายังไม่เคย True มาก่อน -> ค่าใหญ่ (ใช้ 10**9)
+    """
+    out: List[int] = []
+    last_true = None
+    for i, v in enumerate(cond):
+        if v:
+            last_true = i
+            out.append(0)
+        else:
+            out.append(i - last_true if last_true is not None else 10**9)
+    return out
+
+
+def _cdc_action_zone_direction(
+    closes: List[float],
+    ema_fast_len: int = 12,
+    ema_slow_len: int = 26,
+    xsmooth: int = 1,
+) -> Optional[Direction]:
+    """
+    ให้เหมือน Pine CDC ActionZone:
+    - xPrice = EMA(close, xsmooth)
+    - FastMA = EMA(xPrice, 12)
+    - SlowMA = EMA(xPrice, 26)
+    - Green = Bull and xPrice > FastMA
+    - Red   = Bear and xPrice < FastMA
+    - buycond  = Green and Green[1] == 0  (first green)
+    - sellcond = Red   and Red[1] == 0    (first red)
+    - bullish/bearish ด้วย barssince แล้วค่อยออก buy/sell
+    """
+    n = len(closes)
+    if n < max(ema_fast_len, ema_slow_len) + 5:
+        return None
+
+    # xPrice (Pine: ta.ema(xsrc, xsmooth))
+    xprice = _ema(closes, xsmooth) if xsmooth > 1 else closes[:]  # xsmooth=1 => ใช้ close ตรง ๆ
+    fast = _ema(xprice, ema_fast_len)
+    slow = _ema(xprice, ema_slow_len)
+
+    bull = [f > s for f, s in zip(fast, slow)]
+    bear = [f < s for f, s in zip(fast, slow)]
+
+    green = [bull[i] and (xprice[i] > fast[i]) for i in range(n)]
+    red = [bear[i] and (xprice[i] < fast[i]) for i in range(n)]
+
+    buycond = [False] * n
+    sellcond = [False] * n
+    for i in range(1, n):
+        buycond[i] = green[i] and (not green[i - 1])
+        sellcond[i] = red[i] and (not red[i - 1])
+
+    bs_buy = _barssince(buycond)
+    bs_sell = _barssince(sellcond)
+
+    bullish = [bs_buy[i] < bs_sell[i] for i in range(n)]
+    bearish = [bs_sell[i] < bs_buy[i] for i in range(n)]
+
+    # Pine: buy = bearish[1] and buycond ; sell = bullish[1] and sellcond
+    i = n - 1
+    buy = (bearish[i - 1] if i - 1 >= 0 else False) and buycond[i]
+    sell = (bullish[i - 1] if i - 1 >= 0 else False) and sellcond[i]
+
+    if buy:
+        return "LONG"
+    if sell:
+        return "SHORT"
+    return None
+
+
+def _pullback_confirm(
+    direction: Direction,
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    lookback: int = 5,
+) -> bool:
+    """
+    Pullback confirmation (เรียบ/ตรง):
+    - LONG: ใน lookback ล่าสุด ต้องมีการ "ย่อลง" (low ต่ำกว่า low ก่อนหน้า) แล้วปิดกลับขึ้น (close ล่าสุด > close ก่อนหน้า)
+    - SHORT: ใน lookback ล่าสุด ต้องมีการ "เด้งขึ้น" (high สูงกว่า high ก่อนหน้า) แล้วปิดกลับลง (close ล่าสุด < close ก่อนหน้า)
+
+    หมายเหตุ: นี่คือโครงเบื้องต้นเพื่อให้ pipeline เดินได้ก่อน
+    ถ้าคุณมีนิยาม pullback แบบเดิมอยู่แล้ว เดี๋ยวเราย้ายสูตรเดิมมาทับตรงนี้
+    """
+    n = len(closes)
+    if n < lookback + 2:
+        return False
+
+    # ใช้ 2 แท่งท้ายเป็น trigger
+    c1, c2 = closes[-2], closes[-1]
+    if direction == "LONG":
+        # มี lower-low ในช่วง lookback
+        has_pullback = any(lows[i] < lows[i - 1] for i in range(n - lookback, n))
+        return has_pullback and (c2 > c1)
+    else:
+        has_pullback = any(highs[i] > highs[i - 1] for i in range(n - lookback, n))
+        return has_pullback and (c2 < c1)
+
+
+def _default_risk_levels(
+    direction: Direction,
+    entry: float,
+    atr: float,
+    sl_atr_mult: float = 1.5,
+    tp1_rr: float = 1.0,
+    tp2_rr: float = 2.0,
+    tp3_rr: float = 3.0,
+) -> Dict[str, float]:
+    """
+    Risk แบบตรง ๆ:
+    - SL = entry ± (ATR * mult)
+    - TP = entry ± (distance_to_sl * RR)
+    """
+    if atr <= 0:
+        raise ValueError("ATR must be > 0")
+
+    if direction == "LONG":
+        sl = entry - (atr * sl_atr_mult)
+        risk = entry - sl
+        tp1 = entry + risk * tp1_rr
+        tp2 = entry + risk * tp2_rr
+        tp3 = entry + risk * tp3_rr
+    else:
+        sl = entry + (atr * sl_atr_mult)
+        risk = sl - entry
+        tp1 = entry - risk * tp1_rr
+        tp2 = entry - risk * tp2_rr
+        tp3 = entry - risk * tp3_rr
+
+    return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3}
+
+
+def analyze_candles_for_signal(
+    symbol: str,
+    timeframe: str,
+    candles: List[Dict],
+) -> Optional[SignalPayload]:
+    """
+    Input: candles = list of dicts from binance_client.candles_to_dicts()
+    Output: SignalPayload หรือ None
+    """
+    if len(candles) < 60:
+        return None
+
+    closes = [float(c["close"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+
+    direction = _cdc_action_zone_direction(closes, xsmooth=1)
+    if not direction:
+        return None
+
+    if not _pullback_confirm(direction, highs, lows, closes):
+        return None
+
+    atrs = _atr(highs, lows, closes, length=14)
+    atr_now = float(atrs[-1]) if atrs else 0.0
+    if atr_now <= 0:
+        return None
+
+    entry = float(closes[-1])  # entry = close ล่าสุด (เรียบ ๆ ก่อน)
+    risk = _default_risk_levels(direction, entry, atr_now)
+
+    reason = f"CDC({direction}) + Pullback + ATR14={atr_now:.4f}"
+    return SignalPayload(
+        symbol=symbol,
+        timeframe=timeframe,
+        direction=direction,
+        entry_price=entry,
+        stop_loss=float(risk["sl"]),
+        tp1=float(risk["tp1"]),
+        tp2=float(risk["tp2"]),
+        tp3=float(risk["tp3"]),
+        reason=reason,
+    )
+===== app_v23/main.py =====
+# app_v23/main.py
+from __future__ import annotations
+
+import os
+import time
+import threading
+from pathlib import Path
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, jsonify, request
+
+from app_v23.run_once import run_once
+from app_v23.services.daily_reporter import (
+    record_scan,
+    format_daily_summary_message,
+    get_daily_summary_payload,
+)
+from app_v23.services.dispatcher import (
+    send_daily_summary_to_telegram,
+    dispatch_daily_summary_to_sheet,
+)
+
+app = Flask(__name__)
+
+_RUNNING_LOCK = threading.Lock()
+_RUNNING = False
+SYMBOLS_FILE = Path(__file__).resolve().parent / "config" / "symbols.txt"
+
+
+def _load_symbols() -> list[str]:
+    if not SYMBOLS_FILE.exists():
+        return ["BTCUSDT"]
+
+    raw = SYMBOLS_FILE.read_text(encoding="utf-8").strip()
+    if not raw:
+        return ["BTCUSDT"]
+
+    parts: list[str] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        s = chunk.strip().upper()
+        if s:
+            parts.append(s)
+
+    seen = set()
+    out: list[str] = []
+    for s in parts:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out or ["BTCUSDT"]
+
+
+def _require_key() -> tuple[bool, str]:
+    key = (os.getenv("RUN_DAILY_KEY", "") or "").strip()
+    if not key:
+        return True, ""  # dev mode
+    got = (request.args.get("key", "") or "").strip()
+    if got != key:
+        return False, "INVALID_KEY"
+    return True, ""
+
+
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "SIGNAL-V2.3"})
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.post("/run-daily")
+def run_daily():
+    global _RUNNING
+
+    ok, err = _require_key()
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 401
+
+    # ✅ atomic check-and-set ด้วย Lock
+    with _RUNNING_LOCK:
+        if _RUNNING:
+            return jsonify({"ok": False, "error": "ALREADY_RUNNING"}), 409
+        _RUNNING = True
+
+    t0 = time.time()
+    try:
+        timeframe = (request.args.get("timeframe") or "1d").lower()
+        limit = int(request.args.get("limit") or "200")
+
+        one = (request.args.get("symbol") or "").strip().upper()
+        symbols = [one] if one else _load_symbols()
+
+        symbols_param = (request.args.get("symbols") or "").strip()
+        if symbols_param:
+            symbols = [s.strip().upper() for s in symbols_param.split(",") if s.strip()]
+
+        for sym in symbols:
+            run_once(sym, timeframe, limit=limit)
+
+        # ✅ บันทึกจำนวนที่สแกนวันนี้ (สำหรับสรุป 20:00)
+        record_scan(len(symbols))
+
+        return jsonify(
+            {
+                "ok": True,
+                "timeframe": timeframe,
+                "symbols_count": len(symbols),
+                "elapsed_sec": round(time.time() - t0, 2),
+            }
+        )
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING = False
+
+
+def _bool_env(name: str, default: str = "0") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _run_daily_job() -> None:
+    global _RUNNING
+
+    # ✅ atomic check-and-set ด้วย Lock
+    with _RUNNING_LOCK:
+        if _RUNNING:
+            return
+        _RUNNING = True
+
+    try:
+        timeframe = (os.getenv("RUN_DAILY_TIMEFRAME", "1d") or "1d").strip().lower()
+        limit = int(os.getenv("RUN_DAILY_LIMIT", "200") or "200")
+
+        symbols = _load_symbols()
+        for sym in symbols:
+            run_once(sym, timeframe, limit=limit)
+
+        record_scan(len(symbols))
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING = False
+
+
+def _run_2000_report_job() -> None:
+    msg = format_daily_summary_message()
+    send_daily_summary_to_telegram(msg)
+
+    summary = get_daily_summary_payload()
+    dispatch_daily_summary_to_sheet(summary)
+
+
+def _heartbeat_job() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    tz = (os.getenv("SCHED_TZ", "Asia/Bangkok") or "Asia/Bangkok").strip()
+    now_th = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"HEARTBEAT ok at {now_th} tz={tz}", flush=True)
+
+
+def _start_scheduler_if_enabled() -> None:
+    if not _bool_env("ENABLE_INTERNAL_SCHEDULER", "0"):
+        return
+
+    tz = (os.getenv("SCHED_TZ", "Asia/Bangkok") or "Asia/Bangkok").strip()
+
+    # scan time
+    hhmm = (os.getenv("RUN_DAILY_AT", "07:05") or "07:05").strip()
+    try:
+        hour_s, min_s = hhmm.split(":", 1)
+        hour = int(hour_s)
+        minute = int(min_s)
+    except Exception:
+        hour, minute = 7, 5
+
+    # report time
+    rep_hhmm = (os.getenv("RUN_REPORT_AT", "20:00") or "20:00").strip()
+    try:
+        rh, rm = rep_hhmm.split(":", 1)
+        rep_hour = int(rh)
+        rep_min = int(rm)
+    except Exception:
+        rep_hour, rep_min = 20, 0
+
+    sched = BackgroundScheduler(timezone=tz)
+    sched.add_job(_run_daily_job, "cron", hour=hour, minute=minute, id="run_daily_0705", replace_existing=True)
+    sched.add_job(_run_2000_report_job, "cron", hour=rep_hour, minute=rep_min, id="daily_summary_2000", replace_existing=True)
+    sched.add_job(_heartbeat_job, "cron", minute="*/5", id="heartbeat_5min", replace_existing=True)
+    sched.start()
+
+
+_start_scheduler_if_enabled()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
+===== app_v23/run_once.py =====
+# app_v23/run_once.py
+from __future__ import annotations
+
+import sys
+import time
+
+from app_v23.services.binance_client import fetch_ohlcv, candles_to_dicts, fetch_last_price
+from app_v23.core.indicator_engine import analyze_candles_for_signal
+from app_v23.services.dispatcher import dispatch
+from app_v23.services.position_store import (
+    is_locked,
+    create_position,
+    update_on_price,
+    get_last_emitted_close_time_ms,
+    set_last_emitted_close_time_ms,
+)
+
+# Return codes
+RC_SUCCESS        = 0
+RC_SKIP           = 1   # ข้ามแบบปกติ (no signal, already emitted, locked)
+RC_INVALID_INPUT  = 2   # timeframe ไม่รองรับ / candle ไม่พอ
+RC_ERROR          = 3   # exception ที่ไม่คาดคิด
+
+
+def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
+    # ✅ ใช้แค่ 1D
+    if timeframe.lower() != "1d":
+        print("ONLY_1D_ALLOWED")
+        return RC_INVALID_INPUT
+
+    candles = candles_to_dicts(fetch_ohlcv(symbol, timeframe, limit=limit))
+    now_ms = int(time.time() * 1000)
+
+    # ✅ ใช้แท่งปิดแล้วเสมอ: ถ้าแท่งล่าสุดยังไม่ปิด -> ทิ้งมัน
+    last_close_time_ms = int(candles[-1]["close_time_ms"])
+    if now_ms <= last_close_time_ms:
+        candles = candles[:-1]
+        if len(candles) < 60:
+            print("NOT_ENOUGH_CLOSED_CANDLES")
+            return RC_INVALID_INPUT
+        last_close_time_ms = int(candles[-1]["close_time_ms"])
+
+    # ✅ ยิงครั้งเดียวต่อแท่ง
+    last_emitted = get_last_emitted_close_time_ms(symbol, timeframe)
+    if last_emitted == last_close_time_ms:
+        print("ALREADY_EMITTED_THIS_CANDLE")
+        return RC_SKIP
+
+    # 🔒 ถ้ามี ACTIVE → อัปเดตราคาเพื่อปลดล็อกก่อน (ปลดเฉพาะ SL หรือ TP3)
+    if is_locked(symbol, timeframe):
+        last = fetch_last_price(symbol)
+        st = update_on_price(symbol, timeframe, last)
+        print(f"POSITION_UPDATE: {st} last={last}")
+        if st != "CLOSED":
+            print("LOCKED_SKIP")
+            return RC_SKIP
+
+    sig = analyze_candles_for_signal(symbol, timeframe, candles)
+    if not sig:
+        print("NO_SIGNAL")
+        return RC_SKIP
+
+    print(f"SIGNAL: {sig}")
+    dispatch(sig)
+    create_position(sig)
+
+    # ✅ จำว่าแท่งนี้ยิงไปแล้ว
+    set_last_emitted_close_time_ms(symbol, timeframe, last_close_time_ms)
+
+    print("DISPATCHED")
+    return RC_SUCCESS
+
+
+if __name__ == "__main__":
+    # usage: python -m app_v23.run_once BTCUSDT 1d
+    symbol = sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT"
+    tf = sys.argv[2] if len(sys.argv) > 2 else "1d"
+    raise SystemExit(run_once(symbol, tf))
+===== app_v23/services/binance_client.py =====
+# app_v23/services/binance_client.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import time
+import requests
+
+
+BINANCE_BASE_URL = "https://api.binance.com"
+
+
+@dataclass(frozen=True)
+class Candle:
+    open_time_ms: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time_ms: int
+
+
+def fetch_ohlcv(
+    symbol: str,
+    interval: str,
+    limit: int = 500,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    timeout_sec: int = 15,
+) -> List[Candle]:
+    """
+    Fetch OHLCV candles from Binance Klines endpoint.
+    interval examples: "1d", "15m"
+    """
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": int(limit),
+    }
+    if start_time_ms is not None:
+        params["startTime"] = int(start_time_ms)
+    if end_time_ms is not None:
+        params["endTime"] = int(end_time_ms)
+
+    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+
+    try:
+        resp = requests.get(url, params=params, timeout=timeout_sec)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Binance fetch_ohlcv failed: {e}") from e
+
+    candles: List[Candle] = []
+    for row in data:
+        # row layout (Binance): [
+        # 0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume,
+        # 6 closeTime, 7 quoteAssetVolume, 8 numberOfTrades,
+        # 9 takerBuyBaseAssetVolume, 10 takerBuyQuoteAssetVolume, 11 ignore
+        # ]
+        candles.append(
+            Candle(
+                open_time_ms=int(row[0]),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+                close_time_ms=int(row[6]),
+            )
+        )
+    return candles
+
+
+def candles_to_dicts(candles: List[Candle]) -> List[Dict]:
+    """Utility: convert Candle objects to plain dicts (ง่ายต่อการส่งต่อ)."""
+    return [
+        {
+            "open_time_ms": c.open_time_ms,
+            "open": c.open,
+            "high": c.high,
+            "low": c.low,
+            "close": c.close,
+            "volume": c.volume,
+            "close_time_ms": c.close_time_ms,
+        }
+        for c in candles
+    ]
+
+def fetch_last_price(symbol: str, timeout_sec: int = 10) -> float:
+    url = f"{BINANCE_BASE_URL}/api/v3/ticker/price"
+    try:
+        r = requests.get(url, params={"symbol": symbol.upper()}, timeout=timeout_sec)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception as e:
+        raise RuntimeError(f"Binance fetch_last_price failed: {e}") from e
+
+if __name__ == "__main__":
+    # quick smoke test
+    cs = fetch_ohlcv("BTCUSDT", "1d", limit=5)
+    print(candles_to_dicts(cs)[-1])
+===== app_v23/services/daily_reporter.py =====
+# app_v23/services/daily_reporter.py
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict
+from zoneinfo import ZoneInfo
+
+# repo root: .../signal 2.3
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DATA_DIR = _REPO_ROOT / "data"
+_STATS_FILE = _DATA_DIR / "daily_stats.json"
+_POSITIONS_FILE = _DATA_DIR / "positions_clean.json"
+
+
+def _tz() -> ZoneInfo:
+    name = (os.getenv("SCHED_TZ", "Asia/Bangkok") or "Asia/Bangkok").strip()
+    return ZoneInfo(name)
+
+
+def _today_key() -> str:
+    return datetime.now(_tz()).strftime("%Y-%m-%d")
+
+
+def _ensure_data_dir() -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8") or "{}") or default
+    except Exception:
+        return default
+
+
+def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _count_active_positions() -> int:
+    data = _read_json(_POSITIONS_FILE, {"positions": {}})
+    positions = data.get("positions") or {}
+    return len(positions) if isinstance(positions, dict) else 0
+
+
+@dataclass
+class DailyStats:
+    scanned: int = 0
+    signals: int = 0
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "DailyStats":
+        return DailyStats(
+            scanned=int(d.get("scanned", 0) or 0),
+            signals=int(d.get("signals", 0) or 0),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"scanned": int(self.scanned), "signals": int(self.signals)}
+
+
+def load_stats_for_today() -> DailyStats:
+    _ensure_data_dir()
+    key = _today_key()
+    root = _read_json(_STATS_FILE, {"days": {}})
+    days = root.get("days") or {}
+    day = days.get(key) or {}
+    return DailyStats.from_dict(day)
+
+
+def save_stats_for_today(stats: DailyStats) -> None:
+    _ensure_data_dir()
+    key = _today_key()
+    root = _read_json(_STATS_FILE, {"days": {}})
+    if "days" not in root or not isinstance(root["days"], dict):
+        root["days"] = {}
+    root["days"][key] = stats.to_dict()
+    _write_json_atomic(_STATS_FILE, root)
+
+
+def record_scan(count: int) -> None:
+    s = load_stats_for_today()
+    s.scanned += int(count or 0)
+    save_stats_for_today(s)
+
+
+def record_signal() -> None:
+    s = load_stats_for_today()
+    s.signals += 1
+    save_stats_for_today(s)
+
+
+def format_daily_summary_message() -> str:
+    d = _today_key()
+    now_th = datetime.now(_tz()).strftime("%H:%M")
+    s = load_stats_for_today()
+    active = _count_active_positions()
+
+    return (
+        "📊 DAILY SUMMARY (1D)\n\n"
+        f"📅 Date: {d}\n"
+        f"🕗 Time: {now_th} (Asia/Bangkok)\n"
+        f"🔎 Scanned Today: {s.scanned}\n"
+        f"📈 Signals Today: {s.signals}\n"
+        f"📌 Active Positions: {active}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💎 SIGNAL V2.3"
+    )
+
+
+def get_daily_summary_payload() -> Dict[str, Any]:
+    d = _today_key()
+    s = load_stats_for_today()
+    active = _count_active_positions()
+    return {
+        "date": d,
+        "scanned_today": int(s.scanned),
+        "signals_today": int(s.signals),
+        "active_positions": int(active),
+    }
+===== app_v23/services/dispatcher.py =====
+# app_v23/services/dispatcher.py
+from __future__ import annotations
+
+import os
+import requests
+
+from app_v23.core.indicator_engine import SignalPayload
+from app_v23.services.daily_reporter import record_signal
+from app_v23.services.sheets_logger import append_signal_row, append_daily_summary_row
+
+
+def _format_tg_message(p: SignalPayload) -> str:
+    return (
+        f"🚨 SIGNAL {p.timeframe} {p.symbol}\n"
+        f"Direction: {p.direction}\n"
+        f"Entry: {p.entry_price:.4f}\n"
+        f"SL: {p.stop_loss:.4f}\n"
+        f"TP1: {p.tp1:.4f}\n"
+        f"TP2: {p.tp2:.4f}\n"
+        f"TP3: {p.tp3:.4f}\n"
+        f"Reason: {p.reason}"
+    )
+
+
+def send_telegram_text(text: str, topic_env: str = "TOPIC_NORMAL_ID") -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+
+    topic_id = (os.getenv(topic_env, "") or "").strip()
+    if topic_id:
+        try:
+            payload["message_thread_id"] = int(topic_id)
+        except Exception:
+            pass
+
+    r = requests.post(url, json=payload, timeout=15)
+    r.raise_for_status()
+
+
+def send_telegram(payload: SignalPayload) -> None:
+    send_telegram_text(_format_tg_message(payload), topic_env="TOPIC_NORMAL_ID")
+
+
+def send_daily_summary_to_telegram(text: str) -> None:
+    topic_env = (os.getenv("DAILY_REPORT_TOPIC_ENV", "TOPIC_VIP_ID") or "TOPIC_VIP_ID").strip()
+    send_telegram_text(text, topic_env=topic_env)
+
+
+def dispatch(payload: SignalPayload) -> None:
+    # Telegram
+    send_telegram(payload)
+
+    # daily stats
+    record_signal()
+
+    # Sheet
+    try:
+        append_signal_row(payload, sheet_name=os.getenv("GOOGLE_SHEET_TAB", "Signals"))
+        print("SHEET_LOGGED")
+    except Exception as e:
+        print(f"SHEET_SKIPPED: {e}")
+
+
+def dispatch_daily_summary_to_sheet(summary: dict) -> None:
+    try:
+        append_daily_summary_row(
+            summary,
+            sheet_name=os.getenv("GOOGLE_SHEET_DAILY_TAB", "Daily"),
+        )
+        print("SHEET_DAILY_SUMMARY_LOGGED")
+    except Exception as e:
+        print(f"SHEET_DAILY_SUMMARY_SKIPPED: {e}")
+===== app_v23/services/position_store.py =====
+# app_v23/services/position_store.py
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from typing import Dict
+from datetime import datetime, timezone
+from app_v23.core.indicator_engine import SignalPayload
+
+
+POSITIONS_FILE = Path("data/positions_clean.json")
+
+_FILE_LOCK = threading.Lock()  # ป้องกัน race condition ภายใน process เดียวกัน
+
+
+def _key(symbol: str, timeframe: str) -> str:
+    return f"{symbol.upper()}::{timeframe}"
+
+
+def load_positions() -> Dict:
+    if not POSITIONS_FILE.exists():
+        return {"positions": {}}
+    return json.loads(POSITIONS_FILE.read_text(encoding="utf-8") or "{}") or {"positions": {}}
+
+
+def save_positions(state: Dict) -> None:
+    POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    POSITIONS_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_locked(symbol: str, timeframe: str) -> bool:
+    with _FILE_LOCK:
+        state = load_positions()
+    pos = (state.get("positions") or {}).get(_key(symbol, timeframe))
+    if not pos:
+        return False
+    return (pos.get("status") or "").upper() == "ACTIVE"
+
+
+def create_position(payload: SignalPayload) -> None:
+    with _FILE_LOCK:
+        state = load_positions()
+        positions = state.setdefault("positions", {})
+        positions[_key(payload.symbol, payload.timeframe)] = {
+            "symbol": payload.symbol,
+            "timeframe": payload.timeframe,
+            "direction": payload.direction,
+            "entry_price": payload.entry_price,
+            "stop_loss": payload.stop_loss,
+            "tp1": payload.tp1,
+            "tp2": payload.tp2,
+            "tp3": payload.tp3,
+            "status": "ACTIVE",
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "tp3_hit": False,
+            "sl_hit": False,
+        }
+        save_positions(state)
+
+
+def update_on_price(symbol: str, timeframe: str, last_price: float) -> str:
+    """
+    return: ACTIVE / CLOSED / NOT_FOUND
+    ปิดเฉพาะ SL หรือ TP3
+    """
+    with _FILE_LOCK:
+        state = load_positions()
+        positions = state.get("positions") or {}
+
+        k = _key(symbol, timeframe)
+        pos = positions.get(k)
+        if not pos:
+            return "NOT_FOUND"
+
+        if (pos.get("status") or "").upper() != "ACTIVE":
+            return "CLOSED"
+
+        direction = (pos.get("direction") or "").upper()
+        sl = float(pos.get("stop_loss"))
+        tp1 = float(pos.get("tp1"))
+        tp2 = float(pos.get("tp2"))
+        tp3 = float(pos.get("tp3"))
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        def mark(name: str):
+            pos.setdefault("events", {})
+            pos["events"][name] = now
+
+        if direction == "LONG":
+            if last_price <= sl:
+                pos["sl_hit"] = True
+                pos["status"] = "CLOSED"
+                mark("SL")
+            else:
+                if last_price >= tp1:
+                    pos["tp1_hit"] = True
+                    mark("TP1")
+                if last_price >= tp2:
+                    pos["tp2_hit"] = True
+                    mark("TP2")
+                if last_price >= tp3:
+                    pos["tp3_hit"] = True
+                    pos["status"] = "CLOSED"
+                    mark("TP3")
+        else:  # SHORT
+            if last_price >= sl:
+                pos["sl_hit"] = True
+                pos["status"] = "CLOSED"
+                mark("SL")
+            else:
+                if last_price <= tp1:
+                    pos["tp1_hit"] = True
+                    mark("TP1")
+                if last_price <= tp2:
+                    pos["tp2_hit"] = True
+                    mark("TP2")
+                if last_price <= tp3:
+                    pos["tp3_hit"] = True
+                    pos["status"] = "CLOSED"
+                    mark("TP3")
+
+        pos["last_price"] = float(last_price)
+        pos["last_update"] = now
+
+        positions[k] = pos
+        state["positions"] = positions
+        save_positions(state)
+
+    # ---- update Google Sheet — ทำนอก lock เพราะเป็น network call ----
+    try:
+        import os
+        from app_v23.services.sheets_logger import update_hit_status
+
+        tab = os.getenv("GOOGLE_SHEET_TAB", "Signals")
+        update_hit_status(
+            sheet_name=tab,
+            symbol=pos["symbol"],
+            timeframe=pos["timeframe"],
+            direction=pos["direction"],
+            tp1_hit=bool(pos.get("tp1_hit")),
+            tp2_hit=bool(pos.get("tp2_hit")),
+            tp3_hit=bool(pos.get("tp3_hit")),
+            sl_hit=bool(pos.get("sl_hit")),
+            status=str(pos.get("status", "ACTIVE")),
+        )
+    except Exception as e:
+        print(f"SHEET_UPDATE_SKIPPED: {e}")
+
+    return "CLOSED" if (pos.get("status") == "CLOSED") else "ACTIVE"
+
+
+# ==============================
+# Candle emission tracking
+# ==============================
+
+def get_last_emitted_close_time_ms(symbol: str, timeframe: str) -> int:
+    with _FILE_LOCK:
+        state = load_positions()
+    meta = state.get("meta") or {}
+    last = (meta.get("last_emitted") or {}).get(_key(symbol, timeframe))
+    return int(last or 0)
+
+
+def set_last_emitted_close_time_ms(symbol: str, timeframe: str, close_time_ms: int) -> None:
+    with _FILE_LOCK:
+        state = load_positions()
+        meta = state.setdefault("meta", {})
+        last_emitted = meta.setdefault("last_emitted", {})
+        last_emitted[_key(symbol, timeframe)] = int(close_time_ms)
+        save_positions(state)
+===== app_v23/services/sheets_logger.py =====
+from __future__ import annotations
+
+import json
+import os
+import threading
+from typing import List, Optional, Tuple
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+from app_v23.core.indicator_engine import SignalPayload
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# =========================
+# CACHED SERVICE SINGLETON
+# =========================
+_svc_lock = threading.Lock()
+_cached_service = None
+_cached_spreadsheet_id: str = ""
+
+
+def _get_env(name: str) -> str:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        raise RuntimeError(f"Missing {name}")
+    return v
+
+
+def _svc() -> Tuple:
+    """คืน (service, spreadsheet_id) — สร้างครั้งเดียว แล้ว cache ไว้ตลอด process"""
+    global _cached_service, _cached_spreadsheet_id
+
+    if _cached_service is not None:
+        return _cached_service, _cached_spreadsheet_id
+
+    with _svc_lock:
+        # double-checked locking
+        if _cached_service is not None:
+            return _cached_service, _cached_spreadsheet_id
+
+        spreadsheet_id = _get_env("GOOGLE_SHEETS_ID")
+        raw_json = _get_env("GOOGLE_SHEET_SERVICE_ACCOUNT")
+        info = json.loads(raw_json)
+
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+        _cached_service = service
+        _cached_spreadsheet_id = spreadsheet_id
+
+    return _cached_service, _cached_spreadsheet_id
+
+
+def _reset_svc() -> None:
+    """ล้าง cache — ใช้ใน unit test หรือเมื่อ credential เปลี่ยน"""
+    global _cached_service, _cached_spreadsheet_id
+    with _svc_lock:
+        _cached_service = None
+        _cached_spreadsheet_id = ""
+
+
+# =========================
+# SIGNAL ROW (Signals Tab)
+# =========================
+def append_signal_row(payload: SignalPayload, sheet_name: str = "Signals") -> None:
+    service, spreadsheet_id = _svc()
+
+    values: List[List[object]] = [[
+        "=NOW()",
+        payload.symbol,
+        payload.timeframe,
+        payload.direction,
+        payload.entry_price,
+        payload.stop_loss,
+        payload.tp1,
+        payload.tp2,
+        payload.tp3,
+        False,
+        False,
+        False,
+        False,
+        "ACTIVE",
+        payload.reason,
+    ]]
+
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A:O",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    ).execute()
+
+
+# =========================
+# UPDATE TP/SL STATUS
+# =========================
+def _find_latest_active_row(
+    sheet_name: str,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+) -> Optional[int]:
+    service, spreadsheet_id = _svc()  # ← ใช้ cached service เดิม ไม่สร้างใหม่
+
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!B:O",
+    ).execute()
+
+    rows = resp.get("values") or []
+    if not rows:
+        return None
+
+    sym = symbol.strip().upper()
+    tf = timeframe.strip()
+    dirn = direction.strip().upper()
+
+    for idx in range(len(rows) - 1, -1, -1):
+        r = rows[idx]
+        r_sym    = (r[0]  if len(r) > 0  else "").strip().upper()
+        r_tf     = (r[1]  if len(r) > 1  else "").strip()
+        r_dir    = (r[2]  if len(r) > 2  else "").strip().upper()
+        r_status = (r[12] if len(r) > 12 else "").strip().upper()
+
+        if r_sym == sym and r_tf == tf and r_dir == dirn and r_status == "ACTIVE":
+            return idx + 1  # 1-based sheet row (row 1 = header, idx 0 = row 2)
+
+    return None
+
+
+def update_hit_status(
+    sheet_name: str,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    tp1_hit: bool,
+    tp2_hit: bool,
+    tp3_hit: bool,
+    sl_hit: bool,
+    status: str,
+) -> bool:
+    service, spreadsheet_id = _svc()  # ← cached
+
+    row = _find_latest_active_row(sheet_name, symbol, timeframe, direction)
+    if not row:
+        return False
+
+    values = [[
+        bool(tp1_hit),
+        bool(tp2_hit),
+        bool(tp3_hit),
+        bool(sl_hit),
+        status,
+    ]]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!J{row}:N{row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": values},
+    ).execute()
+
+    return True
+
+
+# =========================
+# DAILY SUMMARY (Daily Tab)
+# =========================
+def append_daily_summary_row(summary: dict, sheet_name: str = "Daily") -> None:
+    service, spreadsheet_id = _svc()  # ← cached
+
+    values: List[List[object]] = [[
+        "=NOW()",
+        summary.get("date", ""),
+        int(summary.get("scanned_today", 0) or 0),
+        int(summary.get("signals_today", 0) or 0),
+        int(summary.get("active_positions", 0) or 0),
+    ]]
+
+    service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A:E",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    ).execute()

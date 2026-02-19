@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+import threading
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -21,8 +22,10 @@ from app_v23.services.dispatcher import (
 
 app = Flask(__name__)
 
+_RUNNING_LOCK = threading.Lock()
 _RUNNING = False
 SYMBOLS_FILE = Path(__file__).resolve().parent / "config" / "symbols.txt"
+
 
 def _load_symbols() -> list[str]:
     if not SYMBOLS_FILE.exists():
@@ -66,6 +69,7 @@ def root():
 def health():
     return jsonify({"ok": True})
 
+
 @app.post("/run-daily")
 def run_daily():
     global _RUNNING
@@ -74,10 +78,12 @@ def run_daily():
     if not ok:
         return jsonify({"ok": False, "error": err}), 401
 
-    if _RUNNING:
-        return jsonify({"ok": False, "error": "ALREADY_RUNNING"}), 409
+    # ✅ atomic check-and-set ด้วย Lock
+    with _RUNNING_LOCK:
+        if _RUNNING:
+            return jsonify({"ok": False, "error": "ALREADY_RUNNING"}), 409
+        _RUNNING = True
 
-    _RUNNING = True
     t0 = time.time()
     try:
         timeframe = (request.args.get("timeframe") or "1d").lower()
@@ -105,7 +111,8 @@ def run_daily():
             }
         )
     finally:
-        _RUNNING = False
+        with _RUNNING_LOCK:
+            _RUNNING = False
 
 
 def _bool_env(name: str, default: str = "0") -> bool:
@@ -114,10 +121,13 @@ def _bool_env(name: str, default: str = "0") -> bool:
 
 def _run_daily_job() -> None:
     global _RUNNING
-    if _RUNNING:
-        return
 
-    _RUNNING = True
+    # ✅ atomic check-and-set ด้วย Lock
+    with _RUNNING_LOCK:
+        if _RUNNING:
+            return
+        _RUNNING = True
+
     try:
         timeframe = (os.getenv("RUN_DAILY_TIMEFRAME", "1d") or "1d").strip().lower()
         limit = int(os.getenv("RUN_DAILY_LIMIT", "200") or "200")
@@ -128,7 +138,8 @@ def _run_daily_job() -> None:
 
         record_scan(len(symbols))
     finally:
-        _RUNNING = False
+        with _RUNNING_LOCK:
+            _RUNNING = False
 
 
 def _run_2000_report_job() -> None:
@@ -138,14 +149,14 @@ def _run_2000_report_job() -> None:
     summary = get_daily_summary_payload()
     dispatch_daily_summary_to_sheet(summary)
 
+
 def _heartbeat_job() -> None:
-    # log ให้รู้ว่าระบบยังอยู่ + เวลาไทย
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     tz = (os.getenv("SCHED_TZ", "Asia/Bangkok") or "Asia/Bangkok").strip()
     now_th = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"HEARTBEAT ok at {now_th} tz={tz}", flush=True)    
+    print(f"HEARTBEAT ok at {now_th} tz={tz}", flush=True)
 
 
 def _start_scheduler_if_enabled() -> None:

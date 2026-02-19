@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
+import threading
+from typing import List, Optional, Tuple
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -11,10 +12,14 @@ from app_v23.core.indicator_engine import SignalPayload
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# =========================
+# CACHED SERVICE SINGLETON
+# =========================
+_svc_lock = threading.Lock()
+_cached_service = None
+_cached_spreadsheet_id: str = ""
 
-# =========================
-# ENV + SERVICE
-# =========================
+
 def _get_env(name: str) -> str:
     v = (os.getenv(name) or "").strip()
     if not v:
@@ -22,19 +27,39 @@ def _get_env(name: str) -> str:
     return v
 
 
-def _svc():
-    spreadsheet_id = _get_env("GOOGLE_SHEETS_ID")
+def _svc() -> Tuple:
+    """คืน (service, spreadsheet_id) — สร้างครั้งเดียว แล้ว cache ไว้ตลอด process"""
+    global _cached_service, _cached_spreadsheet_id
 
-    raw_json = _get_env("GOOGLE_SHEET_SERVICE_ACCOUNT")
-    info = json.loads(raw_json)
+    if _cached_service is not None:
+        return _cached_service, _cached_spreadsheet_id
 
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=SCOPES,
-    )
+    with _svc_lock:
+        # double-checked locking
+        if _cached_service is not None:
+            return _cached_service, _cached_spreadsheet_id
 
-    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    return service, spreadsheet_id
+        spreadsheet_id = _get_env("GOOGLE_SHEETS_ID")
+        raw_json = _get_env("GOOGLE_SHEET_SERVICE_ACCOUNT")
+        info = json.loads(raw_json)
+
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+        _cached_service = service
+        _cached_spreadsheet_id = spreadsheet_id
+
+    return _cached_service, _cached_spreadsheet_id
+
+
+def _reset_svc() -> None:
+    """ล้าง cache — ใช้ใน unit test หรือเมื่อ credential เปลี่ยน"""
+    global _cached_service, _cached_spreadsheet_id
+    with _svc_lock:
+        _cached_service = None
+        _cached_spreadsheet_id = ""
 
 
 # =========================
@@ -79,7 +104,7 @@ def _find_latest_active_row(
     timeframe: str,
     direction: str,
 ) -> Optional[int]:
-    service, spreadsheet_id = _svc()
+    service, spreadsheet_id = _svc()  # ← ใช้ cached service เดิม ไม่สร้างใหม่
 
     resp = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
@@ -96,13 +121,13 @@ def _find_latest_active_row(
 
     for idx in range(len(rows) - 1, -1, -1):
         r = rows[idx]
-        r_sym = (r[0] if len(r) > 0 else "").strip().upper()
-        r_tf = (r[1] if len(r) > 1 else "").strip()
-        r_dir = (r[2] if len(r) > 2 else "").strip().upper()
+        r_sym    = (r[0]  if len(r) > 0  else "").strip().upper()
+        r_tf     = (r[1]  if len(r) > 1  else "").strip()
+        r_dir    = (r[2]  if len(r) > 2  else "").strip().upper()
         r_status = (r[12] if len(r) > 12 else "").strip().upper()
 
         if r_sym == sym and r_tf == tf and r_dir == dirn and r_status == "ACTIVE":
-            return idx + 1
+            return idx + 1  # 1-based sheet row (row 1 = header, idx 0 = row 2)
 
     return None
 
@@ -118,7 +143,7 @@ def update_hit_status(
     sl_hit: bool,
     status: str,
 ) -> bool:
-    service, spreadsheet_id = _svc()
+    service, spreadsheet_id = _svc()  # ← cached
 
     row = _find_latest_active_row(sheet_name, symbol, timeframe, direction)
     if not row:
@@ -139,14 +164,14 @@ def update_hit_status(
         body={"values": values},
     ).execute()
 
-    return True   # ✅ สำคัญ: ต้องจบตรงนี้
+    return True
 
 
 # =========================
 # DAILY SUMMARY (Daily Tab)
 # =========================
 def append_daily_summary_row(summary: dict, sheet_name: str = "Daily") -> None:
-    service, spreadsheet_id = _svc()
+    service, spreadsheet_id = _svc()  # ← cached
 
     values: List[List[object]] = [[
         "=NOW()",
