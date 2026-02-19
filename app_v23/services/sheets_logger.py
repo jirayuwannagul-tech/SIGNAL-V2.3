@@ -120,6 +120,8 @@ def _find_latest_active_row(
     dirn = direction.strip().upper()
 
     for idx in range(len(rows) - 1, -1, -1):
+        if idx == 0:  # ← ข้าม header row
+            continue
         r = rows[idx]
         r_sym    = (r[0]  if len(r) > 0  else "").strip().upper()
         r_tf     = (r[1]  if len(r) > 1  else "").strip()
@@ -127,7 +129,7 @@ def _find_latest_active_row(
         r_status = (r[12] if len(r) > 12 else "").strip().upper()
 
         if r_sym == sym and r_tf == tf and r_dir == dirn and r_status == "ACTIVE":
-            return idx + 1  # 1-based sheet row (row 1 = header, idx 0 = row 2)
+            return idx + 1  # idx=1 → sheet row 2 ✅
 
     return None
 

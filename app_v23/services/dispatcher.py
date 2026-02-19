@@ -18,9 +18,11 @@ def _format_tg_message(p: SignalPayload) -> str:
         f"TP1: {p.tp1:.4f}\n"
         f"TP2: {p.tp2:.4f}\n"
         f"TP3: {p.tp3:.4f}\n"
-        f"Reason: {p.reason}"
+        f"Reason: {p.reason}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💎 SIGNAL V2.3"
     )
-
 
 def send_telegram_text(text: str, topic_env: str = "TOPIC_NORMAL_ID") -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -43,7 +45,7 @@ def send_telegram_text(text: str, topic_env: str = "TOPIC_NORMAL_ID") -> None:
 
 
 def send_telegram(payload: SignalPayload) -> None:
-    send_telegram_text(_format_tg_message(payload), topic_env="TOPIC_NORMAL_ID")
+    send_telegram_text(_format_tg_message(payload), topic_env="TOPIC_VIP_ID")
 
 
 def send_daily_summary_to_telegram(text: str) -> None:
