@@ -122,7 +122,6 @@ def _bool_env(name: str, default: str = "0") -> bool:
 def _run_daily_job() -> None:
     global _RUNNING
 
-    # ✅ atomic check-and-set ด้วย Lock
     with _RUNNING_LOCK:
         if _RUNNING:
             return
@@ -137,10 +136,14 @@ def _run_daily_job() -> None:
             run_once(sym, timeframe, limit=limit)
 
         record_scan(len(symbols))
+
+        # ✅ เพิ่มตรงนี้: แจ้ง TG ตอน 07:05 หลัง scan เสร็จ
+        msg = format_daily_summary_message()
+        send_daily_summary_to_telegram(msg)
+
     finally:
         with _RUNNING_LOCK:
             _RUNNING = False
-
 
 def _run_2000_report_job() -> None:
     msg = format_daily_summary_message()
