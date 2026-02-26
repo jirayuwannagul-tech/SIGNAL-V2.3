@@ -108,17 +108,14 @@ def _cdc_action_zone_direction(
     bullish = [bs_buy[i] < bs_sell[i] for i in range(n)]
     bearish = [bs_sell[i] < bs_buy[i] for i in range(n)]
 
-    # Pine: buy = bearish[1] and buycond ; sell = bullish[1] and sellcond
+    # ใช้โซนปัจจุบันแทน first-switch
     i = n - 1
-    buy = (bearish[i - 1] if i - 1 >= 0 else False) and buycond[i]
-    sell = (bullish[i - 1] if i - 1 >= 0 else False) and sellcond[i]
 
-    if buy:
+    if green[i]:
         return "LONG"
-    if sell:
+    if red[i]:
         return "SHORT"
     return None
-
 
 def _pullback_confirm(
     direction: Direction,
@@ -203,9 +200,6 @@ def analyze_candles_for_signal(
     if not direction:
         return None
 
-    if not _pullback_confirm(direction, highs, lows, closes):
-        return None
-
     atrs = _atr(highs, lows, closes, length=14)
     atr_now = float(atrs[-1]) if atrs else 0.0
     if atr_now <= 0:
@@ -214,7 +208,7 @@ def analyze_candles_for_signal(
     entry = float(closes[-1])  # entry = close ล่าสุด (เรียบ ๆ ก่อน)
     risk = _default_risk_levels(direction, entry, atr_now)
 
-    reason = f"CDC({direction}) + Pullback + ATR14={atr_now:.4f}"
+    reason = f"CDC({direction}) + ATR14={atr_now:.4f}"
     return SignalPayload(
         symbol=symbol,
         timeframe=timeframe,
