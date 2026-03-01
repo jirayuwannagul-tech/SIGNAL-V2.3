@@ -79,14 +79,16 @@ def _cdc_action_zone_direction(
     - Red   = Bear and xPrice < FastMA
     - buycond  = Green and Green[1] == 0  (first green)
     - sellcond = Red   and Red[1] == 0    (first red)
-    - bullish/bearish ด้วย barssince แล้วค่อยออก buy/sell
+    - bullish/bearish ด้วย barssince
+    - buy  = bearish[1] and buycond
+    - sell = bullish[1] and sellcond
     """
     n = len(closes)
     if n < max(ema_fast_len, ema_slow_len) + 5:
         return None
 
     # xPrice (Pine: ta.ema(xsrc, xsmooth))
-    xprice = _ema(closes, xsmooth) if xsmooth > 1 else closes[:]  # xsmooth=1 => ใช้ close ตรง ๆ
+    xprice = _ema(closes, xsmooth) if xsmooth > 1 else closes[:]
     fast = _ema(xprice, ema_fast_len)
     slow = _ema(xprice, ema_slow_len)
 
@@ -108,43 +110,16 @@ def _cdc_action_zone_direction(
     bullish = [bs_buy[i] < bs_sell[i] for i in range(n)]
     bearish = [bs_sell[i] < bs_buy[i] for i in range(n)]
 
-    # ใช้โซนปัจจุบันแทน first-switch
+    # Pine: buy = bearish[1] and buycond ; sell = bullish[1] and sellcond
     i = n - 1
+    buy  = (bearish[i - 1] if i - 1 >= 0 else False) and buycond[i]
+    sell = (bullish[i - 1] if i - 1 >= 0 else False) and sellcond[i]
 
-    if green[i]:
+    if buy:
         return "LONG"
-    if red[i]:
+    if sell:
         return "SHORT"
     return None
-
-def _pullback_confirm(
-    direction: Direction,
-    highs: List[float],
-    lows: List[float],
-    closes: List[float],
-    lookback: int = 5,
-) -> bool:
-    """
-    Pullback confirmation (เรียบ/ตรง):
-    - LONG: ใน lookback ล่าสุด ต้องมีการ "ย่อลง" (low ต่ำกว่า low ก่อนหน้า) แล้วปิดกลับขึ้น (close ล่าสุด > close ก่อนหน้า)
-    - SHORT: ใน lookback ล่าสุด ต้องมีการ "เด้งขึ้น" (high สูงกว่า high ก่อนหน้า) แล้วปิดกลับลง (close ล่าสุด < close ก่อนหน้า)
-
-    หมายเหตุ: นี่คือโครงเบื้องต้นเพื่อให้ pipeline เดินได้ก่อน
-    ถ้าคุณมีนิยาม pullback แบบเดิมอยู่แล้ว เดี๋ยวเราย้ายสูตรเดิมมาทับตรงนี้
-    """
-    n = len(closes)
-    if n < lookback + 2:
-        return False
-
-    # ใช้ 2 แท่งท้ายเป็น trigger
-    c1, c2 = closes[-2], closes[-1]
-    if direction == "LONG":
-        # มี lower-low ในช่วง lookback
-        has_pullback = any(lows[i] < lows[i - 1] for i in range(n - lookback, n))
-        return has_pullback and (c2 > c1)
-    else:
-        has_pullback = any(highs[i] > highs[i - 1] for i in range(n - lookback, n))
-        return has_pullback and (c2 < c1)
 
 
 def _default_risk_levels(
@@ -205,7 +180,7 @@ def analyze_candles_for_signal(
     if atr_now <= 0:
         return None
 
-    entry = float(closes[-1])  # entry = close ล่าสุด (เรียบ ๆ ก่อน)
+    entry = float(closes[-1])
     risk = _default_risk_levels(direction, entry, atr_now)
 
     reason = f"CDC({direction}) + ATR14={atr_now:.4f}"
