@@ -10,16 +10,11 @@ from app_v23.services.sheets_logger import append_signal_row, append_daily_summa
 
 
 def _format_tg_message(p: SignalPayload) -> str:
+    action = "🟢 ซื้อ (LONG)" if p.direction == "LONG" else "🔴 ขาย (SHORT)"
     return (
-        f"🚨 SIGNAL {p.timeframe} {p.symbol}\n"
-        f"Direction: {p.direction}\n"
-        f"Entry: {p.entry_price:.4f}\n"
-        f"SL: {p.stop_loss:.4f}\n"
-        f"TP1: {p.tp1:.4f}\n"
-        f"TP2: {p.tp2:.4f}\n"
-        f"TP3: {p.tp3:.4f}\n"
-        f"Reason: {p.reason}\n"
-        f"\n"
+        f"📡 CDC ActionZone ตัดแล้ว!\n\n"
+        f"💎 {p.symbol} {p.timeframe}\n"
+        f"{action}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💎 SIGNAL V2.3"
     )
