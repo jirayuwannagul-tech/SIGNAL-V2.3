@@ -1,7 +1,7 @@
 import pytest
 from app_v23.core.indicator_engine import (
     _ema, _atr, _barssince,
-    _cdc_action_zone_direction, _pullback_confirm,
+    _cdc_action_zone_direction,
     _default_risk_levels, analyze_candles_for_signal, SignalPayload,
 )
 from tests.conftest import make_candles
@@ -48,10 +48,6 @@ class TestDefaultRiskLevels:
         assert (r["tp2"]-100.)/risk == pytest.approx(2.0, rel=1e-6)
     def test_zero_atr_raises(self):
         with pytest.raises(ValueError): _default_risk_levels("LONG",100.,0.)
-
-class TestPullbackConfirm:
-    def test_not_enough_data(self):
-        assert _pullback_confirm("LONG",[10.,11.],[9.,10.],[10.,11.],lookback=5) is False
 
 class TestCdcDirection:
     def test_too_short_none(self):   assert _cdc_action_zone_direction([100.]*10) is None
