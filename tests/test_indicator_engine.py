@@ -1,7 +1,7 @@
 import pytest
 from app_v23.core.indicator_engine import (
     _ema, _atr, _barssince,
-    _cdc_action_zone_direction,
+    _cdc_action_zone_direction, _cdc_action_zone_series,
     _default_risk_levels, analyze_candles_for_signal, SignalPayload,
 )
 from tests.conftest import make_candles
@@ -54,6 +54,10 @@ class TestCdcDirection:
     def test_valid_output(self):
         c = [float(100+i*0.5) for i in range(100)]
         assert _cdc_action_zone_direction(c) in (None,"LONG","SHORT")
+    def test_fixed_timeframe_requires_close_times(self):
+        c = [float(100+i*0.5) for i in range(100)]
+        with pytest.raises(ValueError):
+            _cdc_action_zone_series(c, fixed_timeframe="D")
 
 class TestAnalyzeCandles:
     def test_too_short_none(self):  assert analyze_candles_for_signal("X","1d",make_candles(30)) is None
@@ -63,5 +67,16 @@ class TestAnalyzeCandles:
         if r:
             assert r.direction in ("LONG","SHORT")
             assert r.entry_price > 0
+            assert r.zone in {"GREEN", "BLUE", "LBLUE", "RED", "ORANGE", "YELLOW", "NEUTRAL"}
             if r.direction=="LONG":  assert r.stop_loss < r.entry_price
             else:                    assert r.stop_loss > r.entry_price
+
+    def test_fixed_timeframe_mode_payload(self):
+        candles = make_candles(240, trend=0.2)
+        step_ms = 6 * 60 * 60 * 1000
+        start = 1_700_000_000_000
+        for idx, candle in enumerate(candles):
+            candle["open_time_ms"] = start + (idx * step_ms)
+            candle["close_time_ms"] = candle["open_time_ms"] + step_ms - 1
+        result = analyze_candles_for_signal("BTCUSDT", "6h", candles, fixed_timeframe="D")
+        assert result is None or result.direction in ("LONG", "SHORT")

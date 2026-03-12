@@ -6,7 +6,6 @@ import requests
 
 from app_v23.core.indicator_engine import SignalPayload
 from app_v23.services.daily_reporter import record_signal
-from app_v23.services.sheets_logger import append_signal_row, append_daily_summary_row
 
 
 def _format_tg_message(p: SignalPayload) -> str:
@@ -14,7 +13,8 @@ def _format_tg_message(p: SignalPayload) -> str:
     return (
         f"📡 CDC ActionZone ตัดแล้ว!\n\n"
         f"💎 {p.symbol} {p.timeframe}\n"
-        f"{action}\n\n"
+        f"{action}\n"
+        f"📍 Entry: {p.entry_price:.4f}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💎 SIGNAL V2.3"
     )
@@ -49,26 +49,5 @@ def send_daily_summary_to_telegram(text: str) -> None:
 
 
 def dispatch(payload: SignalPayload) -> None:
-    # Telegram
     send_telegram(payload)
-
-    # daily stats
     record_signal()
-
-    # Sheet
-    try:
-        append_signal_row(payload, sheet_name=os.getenv("GOOGLE_SHEET_TAB", "Signals"))
-        print("SHEET_LOGGED")
-    except Exception as e:
-        print(f"SHEET_SKIPPED: {e}")
-
-
-def dispatch_daily_summary_to_sheet(summary: dict) -> None:
-    try:
-        append_daily_summary_row(
-            summary,
-            sheet_name=os.getenv("GOOGLE_SHEET_DAILY_TAB", "Daily"),
-        )
-        print("SHEET_DAILY_SUMMARY_LOGGED")
-    except Exception as e:
-        print(f"SHEET_DAILY_SUMMARY_SKIPPED: {e}")

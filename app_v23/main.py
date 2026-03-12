@@ -13,12 +13,8 @@ from app_v23.run_once import run_once
 from app_v23.services.daily_reporter import (
     record_scan,
     format_daily_summary_message,
-    get_daily_summary_payload,
 )
-from app_v23.services.dispatcher import (
-    send_daily_summary_to_telegram,
-    dispatch_daily_summary_to_sheet,
-)
+from app_v23.services.dispatcher import send_daily_summary_to_telegram
 
 app = Flask(__name__)
 
@@ -60,6 +56,11 @@ def _require_key() -> tuple[bool, str]:
     return True, ""
 
 
+def _configured_fixed_timeframe() -> str | None:
+    value = (os.getenv("CDC_FIXED_TIMEFRAME", "") or "").strip()
+    return value or None
+
+
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "SIGNAL-V2.3"})
@@ -88,6 +89,7 @@ def run_daily():
     try:
         timeframe = (request.args.get("timeframe") or "1d").lower()
         limit = int(request.args.get("limit") or "200")
+        fixed_timeframe = (request.args.get("fixed_timeframe") or _configured_fixed_timeframe() or "").strip() or None
 
         one = (request.args.get("symbol") or "").strip().upper()
         symbols = [one] if one else _load_symbols()
@@ -97,7 +99,7 @@ def run_daily():
             symbols = [s.strip().upper() for s in symbols_param.split(",") if s.strip()]
 
         for sym in symbols:
-            run_once(sym, timeframe, limit=limit)
+            run_once(sym, timeframe, limit=limit, fixed_timeframe=fixed_timeframe)
 
         # ✅ บันทึกจำนวนที่สแกนวันนี้ (สำหรับสรุป 20:00)
         record_scan(len(symbols))
@@ -106,6 +108,7 @@ def run_daily():
             {
                 "ok": True,
                 "timeframe": timeframe,
+                "fixed_timeframe": fixed_timeframe,
                 "symbols_count": len(symbols),
                 "elapsed_sec": round(time.time() - t0, 2),
             }
@@ -130,10 +133,11 @@ def _run_daily_job() -> None:
     try:
         timeframe = (os.getenv("RUN_DAILY_TIMEFRAME", "1d") or "1d").strip().lower()
         limit = int(os.getenv("RUN_DAILY_LIMIT", "200") or "200")
+        fixed_timeframe = _configured_fixed_timeframe()
 
         symbols = _load_symbols()
         for sym in symbols:
-            run_once(sym, timeframe, limit=limit)
+            run_once(sym, timeframe, limit=limit, fixed_timeframe=fixed_timeframe)
 
         record_scan(len(symbols))
 
@@ -148,9 +152,6 @@ def _run_daily_job() -> None:
 def _run_2000_report_job() -> None:
     msg = format_daily_summary_message()
     send_daily_summary_to_telegram(msg)
-
-    summary = get_daily_summary_payload()
-    dispatch_daily_summary_to_sheet(summary)
 
 
 def _heartbeat_job() -> None:

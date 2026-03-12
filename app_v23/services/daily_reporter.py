@@ -101,27 +101,13 @@ def format_daily_summary_message() -> str:
     d = _today_key()
     now_th = datetime.now(_tz()).strftime("%H:%M")
     s = load_stats_for_today()
-    active = _count_active_positions()
 
     return (
         "📊 DAILY SUMMARY (1D)\n\n"
         f"📅 Date: {d}\n"
         f"🕗 Time: {now_th} (Asia/Bangkok)\n"
         f"🔎 Scanned Today: {s.scanned}\n"
-        f"📈 Signals Today: {s.signals}\n"
-        f"📌 Active Positions: {active}\n\n"
+        "\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "💎 SIGNAL V2.3"
     )
-
-
-def get_daily_summary_payload() -> Dict[str, Any]:
-    d = _today_key()
-    s = load_stats_for_today()
-    active = _count_active_positions()
-    return {
-        "date": d,
-        "scanned_today": int(s.scanned),
-        "signals_today": int(s.signals),
-        "active_positions": int(active),
-    }

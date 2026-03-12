@@ -129,26 +129,6 @@ def update_on_price(symbol: str, timeframe: str, last_price: float) -> str:
         state["positions"] = positions
         save_positions(state)
 
-    # ---- update Google Sheet — ทำนอก lock เพราะเป็น network call ----
-    try:
-        import os
-        from app_v23.services.sheets_logger import update_hit_status
-
-        tab = os.getenv("GOOGLE_SHEET_TAB", "Signals")
-        update_hit_status(
-            sheet_name=tab,
-            symbol=pos["symbol"],
-            timeframe=pos["timeframe"],
-            direction=pos["direction"],
-            tp1_hit=bool(pos.get("tp1_hit")),
-            tp2_hit=bool(pos.get("tp2_hit")),
-            tp3_hit=bool(pos.get("tp3_hit")),
-            sl_hit=bool(pos.get("sl_hit")),
-            status=str(pos.get("status", "ACTIVE")),
-        )
-    except Exception as e:
-        print(f"SHEET_UPDATE_SKIPPED: {e}")
-
     return "CLOSED" if (pos.get("status") == "CLOSED") else "ACTIVE"
 
 

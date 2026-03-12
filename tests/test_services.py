@@ -1,4 +1,4 @@
-import json, pytest
+import pytest
 from unittest.mock import patch, MagicMock
 from app_v23.services.binance_client import Candle, candles_to_dicts, fetch_ohlcv, fetch_last_price
 
@@ -42,8 +42,4 @@ class TestDailyReporter:
     def test_message_keywords(self):
         from app_v23.services.daily_reporter import format_daily_summary_message
         m = format_daily_summary_message()
-        assert "DAILY SUMMARY" in m; assert "Scanned" in m; assert "Signals" in m
-    def test_payload_structure(self):
-        from app_v23.services.daily_reporter import get_daily_summary_payload, record_scan
-        record_scan(20); p = get_daily_summary_payload()
-        assert "date" in p; assert p["scanned_today"]==20
+        assert "DAILY SUMMARY" in m; assert "Scanned" in m; assert "Signals" not in m; assert "Active Positions" not in m

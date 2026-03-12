@@ -28,6 +28,11 @@ class TestFormatMessage:
         msg = _format_tg_message(_sig())
         assert "SIGNAL V2.3" in msg
 
+    def test_contains_timeframe(self):
+        from app_v23.services.dispatcher import _format_tg_message
+        msg = _format_tg_message(_sig())
+        assert "1d" in msg
+
     def test_contains_entry(self):
         from app_v23.services.dispatcher import _format_tg_message
         msg = _format_tg_message(_sig())
@@ -66,24 +71,15 @@ class TestSendTelegramText:
 
 
 class TestDispatch:
-    def test_dispatch_calls_telegram_and_sheet(self):
+    def test_dispatch_calls_telegram_and_record_signal(self):
         from app_v23.services.dispatcher import dispatch
         m_tg = MagicMock()
-        m_sheet = MagicMock()
         m_record = MagicMock()
         with patch("app_v23.services.dispatcher.send_telegram", m_tg), \
-             patch("app_v23.services.dispatcher.append_signal_row", m_sheet), \
              patch("app_v23.services.dispatcher.record_signal", m_record):
             dispatch(_sig())
         assert m_tg.called
         assert m_record.called
-
-    def test_dispatch_sheet_fail_no_raise(self):
-        from app_v23.services.dispatcher import dispatch
-        with patch("app_v23.services.dispatcher.send_telegram"), \
-             patch("app_v23.services.dispatcher.record_signal"), \
-             patch("app_v23.services.dispatcher.append_signal_row", side_effect=Exception("sheet down")):
-            dispatch(_sig())  # ไม่ควร raise
 
 
 class TestSendDailySummary:

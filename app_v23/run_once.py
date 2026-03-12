@@ -1,6 +1,7 @@
 # app_v23/run_once.py
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -22,9 +23,21 @@ RC_INVALID_INPUT  = 2   # timeframe ไม่รองรับ / candle ไม�
 RC_ERROR          = 3   # exception ที่ไม่คาดคิด
 
 
-def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
-    # ✅ ใช้แค่ 1D
-    if timeframe.lower() != "1d":
+def _configured_fixed_timeframe() -> str | None:
+    value = (os.getenv("CDC_FIXED_TIMEFRAME", "") or "").strip()
+    return value or None
+
+
+def _effective_signal_timeframe(timeframe: str, fixed_timeframe: str | None) -> str:
+    return (fixed_timeframe or timeframe).strip()
+
+
+def run_once(symbol: str, timeframe: str, limit: int = 200, fixed_timeframe: str | None = None) -> int:
+    fixed_timeframe = (fixed_timeframe or _configured_fixed_timeframe() or "").strip() or None
+    effective_timeframe = _effective_signal_timeframe(timeframe, fixed_timeframe)
+
+    # ✅ default mode ใช้แค่ 1D; ถ้าเปิด fixed timeframe mode อนุญาต timeframe อื่นได้
+    if fixed_timeframe is None and timeframe.lower() != "1d":
         print("ONLY_1D_ALLOWED")
         return RC_INVALID_INPUT
 
@@ -41,21 +54,21 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
         last_close_time_ms = int(candles[-1]["close_time_ms"])
 
     # ✅ ยิงครั้งเดียวต่อแท่ง
-    last_emitted = get_last_emitted_close_time_ms(symbol, timeframe)
+    last_emitted = get_last_emitted_close_time_ms(symbol, effective_timeframe)
     if last_emitted == last_close_time_ms:
         print("ALREADY_EMITTED_THIS_CANDLE")
         return RC_SKIP
 
     # 🔒 ถ้ามี ACTIVE → อัปเดตราคาเพื่อปลดล็อกก่อน (ปลดเฉพาะ SL หรือ TP3)
-    if is_locked(symbol, timeframe):
+    if is_locked(symbol, effective_timeframe):
         last = fetch_last_price(symbol)
-        st = update_on_price(symbol, timeframe, last)
+        st = update_on_price(symbol, effective_timeframe, last)
         print(f"POSITION_UPDATE: {st} last={last}")
         if st != "CLOSED":
             print("LOCKED_SKIP")
             return RC_SKIP
 
-    sig = analyze_candles_for_signal(symbol, timeframe, candles)
+    sig = analyze_candles_for_signal(symbol, effective_timeframe, candles, fixed_timeframe=fixed_timeframe)
     if not sig:
         print("NO_SIGNAL")
         return RC_SKIP
@@ -65,7 +78,7 @@ def run_once(symbol: str, timeframe: str, limit: int = 200) -> int:
     create_position(sig)
 
     # ✅ จำว่าแท่งนี้ยิงไปแล้ว
-    set_last_emitted_close_time_ms(symbol, timeframe, last_close_time_ms)
+    set_last_emitted_close_time_ms(symbol, effective_timeframe, last_close_time_ms)
 
     print("DISPATCHED")
     return RC_SUCCESS

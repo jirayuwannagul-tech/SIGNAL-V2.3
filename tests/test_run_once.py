@@ -24,6 +24,23 @@ class TestTimeframe:
     def test_4h_invalid(self):  assert run_once("BTCUSDT", "4h")  == RC_INVALID_INPUT
     def test_15m_invalid(self): assert run_once("BTCUSDT", "15m") == RC_INVALID_INPUT
 
+    @patch("app_v23.run_once.set_last_emitted_close_time_ms")
+    @patch("app_v23.run_once.create_position")
+    @patch("app_v23.services.dispatcher.send_telegram_text")
+    @patch("app_v23.run_once.is_locked", return_value=False)
+    @patch("app_v23.run_once.get_last_emitted_close_time_ms", return_value=0)
+    @patch("app_v23.run_once.candles_to_dicts")
+    @patch("app_v23.run_once.fetch_ohlcv")
+    def test_4h_valid_when_fixed_timeframe_enabled(self, mock_fetch, mock_dicts, mock_emitted, mock_locked,
+                                                   mock_tg, mock_create, mock_set):
+        from app_v23.core.indicator_engine import SignalPayload
+        fake = SignalPayload("BTCUSDT", "1d", "LONG", 100., 95., 105., 110., 115., "TEST")
+        mock_fetch.return_value = _objs()
+        mock_dicts.return_value = _old_dicts()
+        with patch("app_v23.run_once.analyze_candles_for_signal", return_value=fake):
+            rc = run_once("BTCUSDT", "4h", fixed_timeframe="1d")
+        assert rc == RC_SUCCESS
+
 
 class TestAlreadyEmitted:
     @patch("app_v23.run_once.is_locked", return_value=False)
@@ -70,4 +87,27 @@ class TestSuccess:
         assert rc == RC_SUCCESS
         mock_tg.assert_called_once()   # Telegram ถูกเรียก
         mock_create.assert_called_once()
+        mock_set.assert_called_once()
+
+    @patch("app_v23.run_once.set_last_emitted_close_time_ms")
+    @patch("app_v23.run_once.create_position")
+    @patch("app_v23.services.dispatcher.send_telegram_text")
+    @patch("app_v23.run_once.update_on_price", return_value="CLOSED")
+    @patch("app_v23.run_once.fetch_last_price", return_value=100.0)
+    @patch("app_v23.run_once.is_locked", return_value=True)
+    @patch("app_v23.run_once.get_last_emitted_close_time_ms", return_value=0)
+    @patch("app_v23.run_once.candles_to_dicts")
+    @patch("app_v23.run_once.fetch_ohlcv")
+    def test_uses_effective_timeframe_for_lock_and_emit(self, mock_fetch, mock_dicts, mock_emitted, mock_locked,
+                                                        mock_last_price, mock_update, mock_tg, mock_create, mock_set):
+        from app_v23.core.indicator_engine import SignalPayload
+        fake = SignalPayload("BTCUSDT", "1d", "LONG", 100., 95., 105., 110., 115., "TEST")
+        mock_fetch.return_value = _objs()
+        mock_dicts.return_value = _old_dicts()
+        with patch("app_v23.run_once.analyze_candles_for_signal", return_value=fake):
+            rc = run_once("BTCUSDT", "4h", fixed_timeframe="1d")
+        assert rc == RC_SUCCESS
+        mock_emitted.assert_called_once_with("BTCUSDT", "1d")
+        mock_locked.assert_called_once_with("BTCUSDT", "1d")
+        mock_update.assert_called_once_with("BTCUSDT", "1d", 100.0)
         mock_set.assert_called_once()
